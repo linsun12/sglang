@@ -13,6 +13,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 
+# flashinfer related dependencies
+from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+from sglang.global_config import global_config
+from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
+
+
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
@@ -43,6 +49,25 @@ class TritonAttnBackend(AttentionBackend):
         self.cuda_graph_max_seq_len = model_runner.model_config.context_len
 
         self.device = model_runner.device
+        
+        # flashinfer related init
+        flashinfer_workspace_buffer = torch.empty(
+            global_config.flashinfer_workspace_size,
+            dtype=torch.uint8,
+            device=model_runner.device,
+        )
+        
+        flashinfer_decode_use_tensor_cores = should_use_tensor_core(
+            kv_cache_dtype=model_runner.kv_cache_dtype,
+            num_attention_heads=model_runner.model_config.num_attention_heads
+            // model_runner.tp_size,
+            num_kv_heads=model_runner.model_config.get_num_kv_heads(
+                model_runner.tp_size
+            ),
+        )
+        
+        # initialize flashinfer decode wrapping function
+        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(flashinfer_workspace_buffer, "NHD", use_tensor_cores=flashinfer_decode_use_tensor_cores)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -152,8 +177,22 @@ class TritonAttnBackend(AttentionBackend):
             layer.logit_cap,
         )
         return o
-
+    
     def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        # use flashinfer decoder
+        # self.flashinfer_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
+        self.triton_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
+        
+
+    def triton_forward_decode(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -193,3 +232,36 @@ class TritonAttnBackend(AttentionBackend):
             layer.logit_cap,
         )
         return o
+    
+    
+    # for flashinfer, call begin_forward/plan to 
+    def flashinfer_forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        # out_cache_loc: kv cache tensor VRAM slot indexing table
+        decode_wrapper = self.flashinfer_decode_wrapper
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
+        o = decode_wrapper.forward(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+        )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)

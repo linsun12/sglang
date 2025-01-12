@@ -346,6 +346,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        
 
         if not self.forward_metadata.use_ragged:
             if k is not None:
@@ -385,6 +386,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
+                # all kv cache save and load are maintained by forward_batch
+                # it keeps record of last kv_cache location
+                # and get kv_cache buffer for current layer (for extend)
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -401,12 +405,14 @@ class FlashInferAttnBackend(AttentionBackend):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
+        
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
 
+        
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -483,6 +489,7 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
+        print("===========update_single_wrapper for DECODE")
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
@@ -661,6 +668,7 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
+        print("=======update single wrapper for PREFILL")
         if use_ragged:
             paged_kernel_lens = prefix_lens
             paged_kernel_lens_sum = paged_kernel_lens.sum().item()
@@ -779,6 +787,7 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(req_pool_indices)
         if spec_info is None:
+            print("===normal extend")
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -820,6 +829,7 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
+        # ATTENTION: the page_size is hardcoded to 1!!!
         wrapper_paged.end_forward()
         wrapper_paged.begin_forward(
             qo_indptr,
@@ -833,6 +843,7 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             custom_mask=custom_mask,
         )
+
 
 
 @triton.jit

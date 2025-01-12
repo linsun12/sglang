@@ -37,6 +37,7 @@ def time_fwd(func, *args, **kwargs):
     return time_f[1].mean * 1e6
 
 
+#============triton decoder===========
 def decode_attention_sglang(
     q,
     kv_data,
@@ -96,6 +97,8 @@ def decode_attention_sglang(
     return f, o
 
 
+
+#==============flashinfer decoder==================
 def decode_attention_flashinfer(dtype, head_num_q, head_num_kv):
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
     use_tensor_cores = should_use_tensor_core(
@@ -122,6 +125,18 @@ def decode_attention_flashinfer(dtype, head_num_q, head_num_kv):
             warmup=10,
         ):
             total_tokens = batch_size * kv_len
+            
+            # some dummy page indices related data
+            # kv_indptr: the index ptr of the paged kv cache, shape [batch_size+1], kv_len is the number of tokens in each sequence
+            # so if each sequence has 100 tokens, and batch size = 4, this is [0, 100, 200, 300, 400]
+            # kv_indices: page indices of the paged kv cache, total_tokens = total number of tokens in this batch saved in cache
+            # example [0,1,2,3,...,399,400]
+            # kv_last_page_len: the number of entries in the last page OF EACH REQUEST in the paged kv cache. Each request has its own
+            # pages, like 4 requests in each batch, each request has 100 tokens in kv cache, each request's kv cache is split in pages
+            # each request's last page has this many entries in it, rest is empty and can be used to insert new kv cache from decoder -> we need to update this
+            # this dummy data makes last page of each request in the batch has 1 entries filled
+            # in this dummy example page_size = 1, each page already has 1 token's kv, so each token's new kv data needs to open a new page
+            
             kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
             kv_indices = torch.arange(0, total_tokens).to(0).int()
             kv_last_page_len = torch.full(
@@ -136,7 +151,7 @@ def decode_attention_flashinfer(dtype, head_num_q, head_num_kv):
                 head_num_q,
                 head_num_kv,
                 head_dim,
-                1,
+                1, # page size
                 pos_encoding_mode="NONE",
                 data_type=dtype,
             )
@@ -208,6 +223,8 @@ if __name__ == "__main__":
     dtype = torch.float16
     batch_size_range = [2**i for i in range(0, 8, 2)]
     kv_len_range = [2**i for i in range(6, 13, 1)]
+    
+    # total number of tokens in each batch
     configs = list(itertools.product(batch_size_range, kv_len_range))
 
     for head_num_q, head_num_kv in [[32, 32], [64, 8], [40, 8]]:
@@ -215,9 +232,13 @@ if __name__ == "__main__":
             dtype, head_num_q, head_num_kv
         ).apply
         for batch_size, kv_len in configs:
+            # q shape: (batch size, number of heads for q, embedding len)
+            # in decoding stage q is one newly generated vector of size head_dim
             q = torch.randn(
                 batch_size, head_num_q, head_dim, dtype=dtype, device="cuda"
             )
+            
+            # k shape: for each head, for each element in batch, shape kv_len(number of tokens in seq) x head_dim(embedding len)
             kv_data = (
                 torch.randn(
                     batch_size * kv_len,
@@ -234,6 +255,8 @@ if __name__ == "__main__":
                     device="cuda",
                 ),
             )
+            
+            # triton's decoder has num_kv_splits
             us_sglang, output_sglang = decode_attention_sglang(
                 q,
                 kv_data,
@@ -244,8 +267,17 @@ if __name__ == "__main__":
                 head_dim,
                 num_kv_splits=8,
             )
+            
+            # flashinfer's decoder has paged attention implemented
             us_flashinfer, _ = attn_flashinfer(
-                q, kv_data, batch_size, kv_len, head_num_q, head_num_kv, head_dim, dtype
+                q, 
+                kv_data, 
+                batch_size, 
+                kv_len, 
+                head_num_q, 
+                head_num_kv, 
+                head_dim, 
+                dtype
             )
             print(
                 head_num_q,
