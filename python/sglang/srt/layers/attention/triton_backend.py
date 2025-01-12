@@ -16,8 +16,10 @@ if TYPE_CHECKING:
 # flashinfer related dependencies
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 from sglang.global_config import global_config
-from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
-
+from typing import TYPE_CHECKING, List, Optional
+import triton
+import triton.language as tl
+import os 
 
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
@@ -50,7 +52,7 @@ class TritonAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         
-        # flashinfer related init
+        # ======= flashinfer decode related initialization =========
         flashinfer_workspace_buffer = torch.empty(
             global_config.flashinfer_workspace_size,
             dtype=torch.uint8,
@@ -66,24 +68,42 @@ class TritonAttnBackend(AttentionBackend):
             ),
         )
         
-        # initialize flashinfer decode wrapping function
         self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(flashinfer_workspace_buffer, "NHD", use_tensor_cores=flashinfer_decode_use_tensor_cores)
+    
+        # flashinfer indices update
+        flashinfer_max_bs = model_runner.req_to_token_pool.size
+        self.flashinfer_kv_indptr = torch.zeros((flashinfer_max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+        self.flashinfer_kv_last_page_len = torch.ones((flashinfer_max_bs,), dtype=torch.int32, device=model_runner.device)
+        self.flashinfer_qo_indptr = torch.zeros((flashinfer_max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+        self.flashinfer_indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
         if forward_batch.forward_mode.is_decode():
-            attn_logits = torch.empty(
-                (
-                    forward_batch.batch_size,
-                    self.num_head,
-                    self.num_kv_splits,
-                    self.v_head_dim + 1,
-                ),
-                dtype=torch.float32,
-                device=self.device,
-            )
+            # attn_logits = torch.empty(
+            #     (
+            #         forward_batch.batch_size,
+            #         self.num_head,
+            #         self.num_kv_splits,
+            #         self.v_head_dim + 1,
+            #     ),
+            #     dtype=torch.float32,
+            #     device=self.device,
+            # )
 
+            # max_extend_len = None
+            
+            # flashinfer decoder update
+            self.flashinfer_indices_updater_decode.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                decode_wrapper=self.flashinfer_decode_wrapper,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=forward_batch.spec_info,
+            )
+            attn_logits = None
             max_extend_len = None
         else:
             attn_logits = None
@@ -188,8 +208,8 @@ class TritonAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         # use flashinfer decoder
-        # self.flashinfer_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
-        self.triton_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
+        return self.flashinfer_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
+        # return self.triton_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         
 
     def triton_forward_decode(
@@ -265,3 +285,190 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+
+
+class FlashInferIndicesUpdaterDecode:
+    def __init__(self, model_runner: ModelRunner):
+        # Parse Constants
+        self.num_qo_heads = (
+            model_runner.model_config.num_attention_heads // model_runner.tp_size
+        )
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            model_runner.tp_size
+        )
+        self.head_dim = model_runner.model_config.head_dim
+        self.data_type = model_runner.kv_cache_dtype
+        self.q_data_type = model_runner.dtype
+        self.sliding_window_size = model_runner.sliding_window_size
+
+        # Buffers and wrappers
+        max_bs = model_runner.req_to_token_pool.size
+        self.kv_indptr = torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+        self.kv_last_page_len = torch.ones((max_bs,), dtype=torch.int32, device=model_runner.device)
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.update = self.update_single_wrapper
+
+    def update(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        decode_wrapper: BatchDecodeWithPagedKVCacheWrapper,
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInfo],
+    ):
+        # Keep the signature for type checking. It will be assigned during runtime.
+        raise NotImplementedError()
+
+    def update_single_wrapper(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        decode_wrapper: BatchDecodeWithPagedKVCacheWrapper,
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInfo],
+    ):
+        print("===========update_single_wrapper for DECODE")
+        self.call_begin_forward(
+            decode_wrapper,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            self.kv_indptr,
+            None,
+            spec_info,
+        )
+
+    def call_begin_forward(
+        self,
+        wrapper: BatchDecodeWithPagedKVCacheWrapper,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        kv_indptr: torch.Tensor,
+        kv_start_idx: torch.Tensor,
+        spec_info: Optional[SpecInfo],
+    ):
+        if spec_info is None:
+            bs = len(req_pool_indices)
+            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                paged_kernel_lens,
+                kv_indptr,
+                kv_start_idx,
+                kv_indices,
+                self.req_to_token.shape[1],
+            )
+        else:
+            bs, kv_indices, kv_indptr = spec_info.generate_attn_arg_decode(
+                req_pool_indices,
+                paged_kernel_lens,
+                self.req_to_token,
+            )
+
+        wrapper.end_forward()
+        wrapper.begin_forward(
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len[:bs],
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
+            data_type=self.data_type,
+            q_data_type=self.q_data_type,
+        )
+
+
+
+@triton.jit
+def create_flashinfer_kv_indices_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    page_kernel_lens_ptr,
+    kv_indptr,
+    kv_start_idx,
+    kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    kv_indices_offset = tl.load(kv_indptr + pid)
+
+    kv_start = 0
+    kv_end = 0
+    if kv_start_idx:
+        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
+        kv_end = kv_start
+    kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
+
+    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < kv_end - kv_start
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + offset,
+            mask=mask,
+        )
+        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+        
+
+def should_use_tensor_core(
+    kv_cache_dtype: torch.dtype,
+    num_attention_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    """
+    Determine whether to use tensor cores for attention computation.
+
+    Args:
+        kv_cache_dtype: Data type of the KV cache
+        num_attention_heads: Number of attention heads
+        num_kv_heads: Number of key/value heads
+
+    Returns:
+        bool: Whether to use tensor cores
+    """
+    # Try to use environment variable first
+    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
+    if env_override is not None:
+        return env_override.lower() == "true"
+
+    # Try to use _grouped_size_compiled_for_decode_kernels if available
+    # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
+    try:
+        from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+
+        if not _grouped_size_compiled_for_decode_kernels(
+            num_attention_heads,
+            num_kv_heads,
+        ):
+            return True
+        else:
+            return False
+    except (ImportError, AttributeError):
+        pass
+
+    # Calculate GQA group size
+    gqa_group_size = num_attention_heads // num_kv_heads
+
+    # Determine based on dtype and GQA group size
+    if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return True
+    elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
+        return gqa_group_size > 4
+    else:
+        return False

@@ -144,6 +144,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode():
+            print("====init forward metadata for decode is called")
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -500,6 +501,9 @@ class FlashInferIndicesUpdaterDecode:
             None,
             spec_info,
         )
+        print("kv_indptr", self.kv_indptr)
+        print("kv_last_page_len", self.kv_last_page_len)
+        print("")
 
     def update_sliding_window(
         self,
@@ -510,6 +514,8 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
+        
+        print("==========update DECODE sliding window called")
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Sliding window attention
@@ -544,6 +550,8 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
+        
+        print("====udpate DECODE cross attention called")
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Normal attention
@@ -702,6 +710,7 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
+        print("===========update PREFILL sliding window called")
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # window attention use paged only
@@ -743,6 +752,7 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
+        print("===========update PREFILL cross attention called")
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # normal attention
