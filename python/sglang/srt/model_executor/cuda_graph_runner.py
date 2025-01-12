@@ -128,6 +128,7 @@ class CudaGraphRunner:
             self.capture_bs = list(range(1, 33)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+        
 
         if max(self.capture_bs) > model_runner.req_to_token_pool.size:
             # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -148,8 +149,11 @@ class CudaGraphRunner:
             if bs <= model_runner.req_to_token_pool.size
             and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
+        print("===========capture bs: ", self.capture_bs)
 
+        # ATTENTION: why is mode set to DECODE? does cudagraph only capture decode? 
         self.capture_forward_mode = ForwardMode.DECODE
+        # only one token is used to capture each batch decode 
         self.num_tokens_per_bs = 1
 
         if model_runner.spec_algorithm.is_eagle():
@@ -174,6 +178,7 @@ class CudaGraphRunner:
         )
 
         # Attention backend
+        # attention backend provides some config data for cuda graph? 
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
@@ -299,6 +304,7 @@ class CudaGraphRunner:
                 save_gemlite_cache()
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
+        # capture function for one batch size
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs

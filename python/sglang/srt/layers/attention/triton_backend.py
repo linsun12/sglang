@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 import os 
 
+
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
@@ -53,13 +54,13 @@ class TritonAttnBackend(AttentionBackend):
         self.device = model_runner.device
         
         # ======= flashinfer decode related initialization =========
-        flashinfer_workspace_buffer = torch.empty(
+        self.flashinfer_workspace_buffer = torch.empty(
             global_config.flashinfer_workspace_size,
             dtype=torch.uint8,
             device=model_runner.device,
         )
         
-        flashinfer_decode_use_tensor_cores = should_use_tensor_core(
+        self.flashinfer_decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
             // model_runner.tp_size,
@@ -69,7 +70,8 @@ class TritonAttnBackend(AttentionBackend):
         )
         
         # flashinfer decode function
-        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(flashinfer_workspace_buffer, "NHD", use_tensor_cores=flashinfer_decode_use_tensor_cores)
+        # will be overwritten if cuda_graph is enabled
+        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(self.flashinfer_workspace_buffer, "NHD", use_tensor_cores=self.flashinfer_decode_use_tensor_cores)
     
         # flashinfer indices update
         flashinfer_max_bs = model_runner.req_to_token_pool.size
@@ -77,6 +79,10 @@ class TritonAttnBackend(AttentionBackend):
         self.flashinfer_kv_last_page_len = torch.ones((flashinfer_max_bs,), dtype=torch.int32, device=model_runner.device)
         self.flashinfer_qo_indptr = torch.zeros((flashinfer_max_bs + 1,), dtype=torch.int32, device=model_runner.device)
         self.flashinfer_indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner)
+        
+        # flashinfer cuda graph 
+        self.flashinfer_max_context_len = model_runner.model_config.context_len
+        self.flashinfer_decode_cuda_graph_metadata = {} # wrapper used for each bs, but here only update_single_wrapper is used
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -111,8 +117,19 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
         self.forward_metadata = attn_logits, max_extend_len
-
+        
     def init_cuda_graph_state(self, max_bs: int):
+        self.flashinfer_init_cuda_graph_state(max_bs)
+        
+    def flashinfer_init_cuda_graph_state(self, max_bs: int):
+        print("============init_cuda_graph_state")
+        self.flashinfer_cuda_graph_kv_indices = torch.zeros(
+            (max_bs * self.flashinfer_max_context_len,),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    def triton_init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_max_total_num_tokens = max_bs * self.cuda_graph_max_seq_len
 
         self.cuda_graph_start_loc = torch.zeros(
@@ -123,8 +140,52 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device="cuda",
         )
-
+        
     def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
+    ):
+        self.flashinfer_init_forward_metadata_capture_cuda_graph(bs, num_tokens, req_pool_indices, seq_lens, encoder_lens, forward_mode, spec_info)
+        
+    def flashinfer_init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
+    ):
+        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                    self.flashinfer_workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=True,
+                    use_tensor_cores=self.flashinfer_decode_use_tensor_cores,
+                    paged_kv_indptr_buffer=self.flashinfer_kv_indptr[: num_tokens + 1],
+                    paged_kv_indices_buffer=self.flashinfer_cuda_graph_kv_indices,
+                    paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[
+                        :num_tokens
+                    ],
+                )
+        seq_lens_sum = seq_lens.sum().item()
+        self.flashinfer_indices_updater_decode.update(
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            decode_wrapper=self.flashinfer_decode_wrapper,
+            encoder_lens=encoder_lens,
+            spec_info=spec_info,
+        )
+        self.flashinfer_decode_cuda_graph_metadata[bs] = self.flashinfer_decode_wrapper
+        
+    def triton_init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
         num_tokens: int,
@@ -153,11 +214,49 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
+        self.flashinfer_init_forward_metadata_replay_cuda_graph(bs, req_pool_indices, seq_lens, seq_lens_sum, encoder_lens, forward_mode, spec_info)
+        
+    def flashinfer_init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
+    ):
+        self.flashinfer_indices_updater_decode.update(
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            seq_lens_sum,
+            decode_wrappers=self.flashinfer_decode_cuda_graph_metadata[bs],
+            encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+            spec_info=spec_info,
+        )
+    
+    def triton_init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
+    ):
         # NOTE: encoder_lens expected to be zeros or None
         self.cuda_graph_start_loc.zero_()
         self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)
-
+        
+        
     def get_cuda_graph_seq_len_fill_value(self):
+        return self.flashinfer_get_cuda_graph_seq_len_fill_value()
+    
+    def flashinfer_get_cuda_graph_seq_len_fill_value(self):
+        return 0
+
+    def triton_get_cuda_graph_seq_len_fill_value(self):
         return 1
 
     def forward_extend(
@@ -286,8 +385,7 @@ class TritonAttnBackend(AttentionBackend):
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
-
-
+    
 
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner):
