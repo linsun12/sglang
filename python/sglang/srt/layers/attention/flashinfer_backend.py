@@ -144,7 +144,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode():
-            print("====init forward metadata for decode is called")
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -490,7 +489,6 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
-        print("===========update_single_wrapper for DECODE")
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
@@ -515,7 +513,6 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInfo],
     ):
         
-        print("==========update DECODE sliding window called")
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Sliding window attention
@@ -551,7 +548,6 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInfo],
     ):
         
-        print("====udpate DECODE cross attention called")
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # Normal attention
@@ -676,7 +672,6 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
-        print("=======update single wrapper for PREFILL")
         if use_ragged:
             paged_kernel_lens = prefix_lens
             paged_kernel_lens_sum = paged_kernel_lens.sum().item()
@@ -710,7 +705,6 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
-        print("===========update PREFILL sliding window called")
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # window attention use paged only
@@ -752,7 +746,6 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
-        print("===========update PREFILL cross attention called")
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # normal attention
@@ -797,7 +790,6 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         bs = len(req_pool_indices)
         if spec_info is None:
-            print("===normal extend")
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]

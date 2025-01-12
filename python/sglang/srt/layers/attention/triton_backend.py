@@ -68,6 +68,7 @@ class TritonAttnBackend(AttentionBackend):
             ),
         )
         
+        # flashinfer decode function
         self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(flashinfer_workspace_buffer, "NHD", use_tensor_cores=flashinfer_decode_use_tensor_cores)
     
         # flashinfer indices update
@@ -168,6 +169,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        print("================triton forward extend is called================")
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -207,7 +209,6 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # use flashinfer decoder
         return self.flashinfer_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         # return self.triton_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         
@@ -254,7 +255,6 @@ class TritonAttnBackend(AttentionBackend):
         return o
     
     
-    # for flashinfer, call begin_forward/plan to 
     def flashinfer_forward_decode(
         self,
         q: torch.Tensor,
@@ -264,6 +264,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        print("==============flashinfer forward decode is called==================")
         # out_cache_loc: kv cache tensor VRAM slot indexing table
         decode_wrapper = self.flashinfer_decode_wrapper
         cache_loc = (
