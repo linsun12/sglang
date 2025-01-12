@@ -22,6 +22,8 @@ import triton.language as tl
 import os 
 
 
+
+# ATTENTION: This backend mix triton extend and flashinfer decode
 class TritonAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
@@ -119,10 +121,10 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata = attn_logits, max_extend_len
         
     def init_cuda_graph_state(self, max_bs: int):
+        print("=====cuda graph is enabled===========")
         self.flashinfer_init_cuda_graph_state(max_bs)
         
     def flashinfer_init_cuda_graph_state(self, max_bs: int):
-        print("============init_cuda_graph_state")
         self.flashinfer_cuda_graph_kv_indices = torch.zeros(
             (max_bs * self.flashinfer_max_context_len,),
             dtype=torch.int32,
@@ -151,6 +153,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
+        print("========== capture cuda graph for flashinfer decode ==============")
         self.flashinfer_init_forward_metadata_capture_cuda_graph(bs, num_tokens, req_pool_indices, seq_lens, encoder_lens, forward_mode, spec_info)
         
     def flashinfer_init_forward_metadata_capture_cuda_graph(
@@ -214,6 +217,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
+        print("=========replay captured cuda graph for flashinfer decode==========")
         self.flashinfer_init_forward_metadata_replay_cuda_graph(bs, req_pool_indices, seq_lens, seq_lens_sum, encoder_lens, forward_mode, spec_info)
         
     def flashinfer_init_forward_metadata_replay_cuda_graph(
@@ -230,7 +234,7 @@ class TritonAttnBackend(AttentionBackend):
             req_pool_indices[:bs],
             seq_lens[:bs],
             seq_lens_sum,
-            decode_wrappers=self.flashinfer_decode_cuda_graph_metadata[bs],
+            decode_wrapper=self.flashinfer_decode_cuda_graph_metadata[bs],
             encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
             spec_info=spec_info,
         )
@@ -429,7 +433,6 @@ class FlashInferIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
-        print("===========update_single_wrapper for DECODE")
         self.call_begin_forward(
             decode_wrapper,
             req_pool_indices,
