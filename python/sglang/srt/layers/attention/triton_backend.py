@@ -121,7 +121,6 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata = attn_logits, max_extend_len
         
     def init_cuda_graph_state(self, max_bs: int):
-        print("=====cuda graph is enabled===========")
         self.flashinfer_init_cuda_graph_state(max_bs)
         
     def flashinfer_init_cuda_graph_state(self, max_bs: int):
@@ -153,7 +152,6 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-        print("========== capture cuda graph for flashinfer decode ==============")
         self.flashinfer_init_forward_metadata_capture_cuda_graph(bs, num_tokens, req_pool_indices, seq_lens, encoder_lens, forward_mode, spec_info)
         
     def flashinfer_init_forward_metadata_capture_cuda_graph(
@@ -217,7 +215,6 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-        print("=========replay captured cuda graph for flashinfer decode==========")
         self.flashinfer_init_forward_metadata_replay_cuda_graph(bs, req_pool_indices, seq_lens, seq_lens_sum, encoder_lens, forward_mode, spec_info)
         
     def flashinfer_init_forward_metadata_replay_cuda_graph(
@@ -272,7 +269,6 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        print("================triton forward extend is called================")
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -367,7 +363,6 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        print("==============flashinfer forward decode is called==================")
         # out_cache_loc: kv cache tensor VRAM slot indexing table
         decode_wrapper = self.flashinfer_decode_wrapper
         cache_loc = (

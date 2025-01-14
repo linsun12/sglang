@@ -106,10 +106,15 @@ def decode_attention_flashinfer(dtype, head_num_q, head_num_kv):
         num_attention_heads=head_num_q,
         num_kv_heads=head_num_kv,
     )
-    flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, "NHD", use_tensor_cores=use_tensor_cores
-    )
+    # flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+    #     workspace_buffer, "NHD", use_tensor_cores=use_tensor_cores
+    # )
 
+    flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", use_tensor_cores=False
+    )
+    
+    
     class FlashinferAttention(torch.autograd.Function):
         @staticmethod
         def forward(
@@ -144,6 +149,14 @@ def decode_attention_flashinfer(dtype, head_num_q, head_num_kv):
             )
 
             flashinfer_decode_wrapper.end_forward()
+            
+            # printout all input combination
+            print("group size: ", head_num_q / head_num_kv)
+            # group_size is hardcoded to [1,2,3,4,8]
+            # skip group sizes not inside above list
+            
+            
+            
             flashinfer_decode_wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
@@ -228,67 +241,72 @@ if __name__ == "__main__":
     configs = list(itertools.product(batch_size_range, kv_len_range))
 
     for head_num_q, head_num_kv in [[32, 32], [64, 8], [40, 8]]:
-        attn_flashinfer = decode_attention_flashinfer(
-            dtype, head_num_q, head_num_kv
-        ).apply
-        for batch_size, kv_len in configs:
-            # q shape: (batch size, number of heads for q, embedding len)
-            # in decoding stage q is one newly generated vector of size head_dim
-            q = torch.randn(
-                batch_size, head_num_q, head_dim, dtype=dtype, device="cuda"
-            )
-            
-            # k shape: for each head, for each element in batch, shape kv_len(number of tokens in seq) x head_dim(embedding len)
-            kv_data = (
-                torch.randn(
-                    batch_size * kv_len,
+        if ((head_num_q / head_num_kv) in [1,2,3,4,8]):
+            attn_flashinfer = decode_attention_flashinfer(
+                dtype, head_num_q, head_num_kv
+            ).apply
+            for batch_size, kv_len in configs:
+                # q shape: (batch size, number of heads for q, embedding len)
+                # in decoding stage q is one newly generated vector of size head_dim
+                q = torch.randn(
+                    batch_size, head_num_q, head_dim, dtype=dtype, device="cuda"
+                )
+                
+                # k shape: for each head, for each element in batch, shape kv_len(number of tokens in seq) x head_dim(embedding len)
+                kv_data = (
+                    torch.randn(
+                        batch_size * kv_len,
+                        head_num_kv,
+                        head_dim,
+                        dtype=dtype,
+                        device="cuda",
+                    ),
+                    torch.randn(
+                        batch_size * kv_len,
+                        head_num_kv,
+                        head_dim,
+                        dtype=dtype,
+                        device="cuda",
+                    ),
+                )
+                
+                # triton's decoder has num_kv_splits
+                us_sglang, output_sglang = decode_attention_sglang(
+                    q,
+                    kv_data,
+                    batch_size,
+                    kv_len,
+                    head_num_q,
                     head_num_kv,
                     head_dim,
-                    dtype=dtype,
-                    device="cuda",
-                ),
-                torch.randn(
-                    batch_size * kv_len,
+                    num_kv_splits=8,
+                )
+                
+                # flashinfer's decoder has paged attention implemented
+                
+                
+                
+                # num_qo_heads / num_kv_heads
+                us_flashinfer, _ = attn_flashinfer(
+                    q, 
+                    kv_data, 
+                    batch_size, 
+                    kv_len, 
+                    head_num_q, 
+                    head_num_kv, 
+                    head_dim, 
+                    dtype
+                )
+                print(
+                    head_num_q,
+                    "  ",
                     head_num_kv,
-                    head_dim,
-                    dtype=dtype,
-                    device="cuda",
-                ),
-            )
-            
-            # triton's decoder has num_kv_splits
-            us_sglang, output_sglang = decode_attention_sglang(
-                q,
-                kv_data,
-                batch_size,
-                kv_len,
-                head_num_q,
-                head_num_kv,
-                head_dim,
-                num_kv_splits=8,
-            )
-            
-            # flashinfer's decoder has paged attention implemented
-            us_flashinfer, _ = attn_flashinfer(
-                q, 
-                kv_data, 
-                batch_size, 
-                kv_len, 
-                head_num_q, 
-                head_num_kv, 
-                head_dim, 
-                dtype
-            )
-            print(
-                head_num_q,
-                "  ",
-                head_num_kv,
-                "  ",
-                batch_size,
-                "  ",
-                kv_len,
-                "  ",
-                us_sglang,
-                "  ",
-                us_flashinfer,
-            )
+                    "  ",
+                    batch_size,
+                    "  ",
+                    kv_len,
+                    "  ",
+                    us_sglang,
+                    "  ",
+                    us_flashinfer,
+                )
