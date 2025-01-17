@@ -33,6 +33,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.mix_triton_flashinfer_backend import MixTritonFlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -604,7 +605,9 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if self.server_args.attention_backend == "flashinfer":
+        if self.server_args.attention_backend == "mix_triton_flashinfer":
+            self.attn_backend = MixTritonFlashInferAttnBackend(self)
+        elif self.server_args.attention_backend == "flashinfer":
             self.attn_backend = FlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
