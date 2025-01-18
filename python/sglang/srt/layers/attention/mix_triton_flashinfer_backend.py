@@ -13,30 +13,38 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 
-# flashinfer related dependencies
+#======== flashinfer related dependencies ===========
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 from sglang.global_config import global_config
 from typing import TYPE_CHECKING, List, Optional
 import triton
 import triton.language as tl
 import os 
+from enum import Enum, auto
+from dataclasses import dataclass
 
+
+class FlashInferWrapperDispatch(Enum):
+    SLIDING_WINDOW = auto()
+    CROSS_ATTENTION = auto()
+    
+    
+@dataclass
+class FlashInferDecodeMetadata:
+    decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
 
 
 # ATTENTION: This backend mix triton extend and flashinfer decode
 class MixTritonFlashInferAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.attention.triton_ops.decode_attention import (
-            decode_attention_fwd,
-        )
+        #=========triton extend init==============
+        # Lazy import of trition op to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,
         )
 
         super().__init__()
 
-        self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
 
         if model_runner.server_args.enable_dp_attention:
@@ -55,13 +63,8 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         
-        # ======= flashinfer decode related initialization =========
-        self.flashinfer_workspace_buffer = torch.empty(
-            global_config.flashinfer_workspace_size,
-            dtype=torch.uint8,
-            device=model_runner.device,
-        )
-        
+        #===========flashinfer decode init============
+        # currently only group size is conditioned in use_tensor_core function
         self.flashinfer_decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
@@ -71,16 +74,64 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
             ),
         )
         
+        # sliding window is supported in flashinfer backend
+        # sliding window and cross attention wrappers can't coexit in flashinfer
+        # total number of decode wrappers is <= 2
+        assert not (
+            model_runner.sliding_window_size is not None
+            and model_runner.model_config.is_encoder_decoder
+        ), "Sliding window and cross attention are not supported together"
+
+        if model_runner.sliding_window_size is not None:
+            self.flashinfer_num_wrappers = 2
+            self.flashinfer_dispatch_reason = FlashInferWrapperDispatch.SLIDING_WINDOW
+        elif model_runner.model_config.is_encoder_decoder:
+            # encoder+decoder model requires cross attention 
+            self.flashinfer_num_wrappers = 2
+            self.flashinfer_dispatch_reason = FlashInferWrapperDispatch.CROSS_ATTENTION
+        else:
+            self.flashinfer_num_wrappers = 1
+            self.flashinfer_dispatch_reason = None
+            
+        # workspace assigned to flashinfer decoder
+        self.flashinfer_workspace_buffer = torch.empty(
+            global_config.flashinfer_workspace_size,
+            dtype=torch.uint8,
+            device=model_runner.device,
+        )
+        
+        self.flashinfer_max_bs = model_runner.req_to_token_pool.size
+        # kv indptr for each wrapper
+        self.flashinfer_kv_indptr = [
+            torch.zeros((self.flashinfer_max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+            for _ in range(self.flashinfer_num_wrappers)
+        ]
+        # last page len are all initialized to 1, page size is hardcoded to 1 
+        self.flashinfer_kv_last_page_len = torch.ones(
+            (self.flashinfer_max_bs,), dtype=torch.int32, device=model_runner.device
+        )
+        # q indptr for each wrapper
+        self.flashinfer_qo_indptr = [
+            torch.zeros((self.flashinfer_max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+            for _ in range(self.flashinfer_num_wrappers)
+        ]
+        
+        
         # flashinfer decode function
         # will be overwritten if cuda_graph is enabled
-        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(self.flashinfer_workspace_buffer, "NHD", use_tensor_cores=self.flashinfer_decode_use_tensor_cores)
-    
-        # flashinfer indices update
-        flashinfer_max_bs = model_runner.req_to_token_pool.size
-        self.flashinfer_kv_indptr = torch.zeros((flashinfer_max_bs + 1,), dtype=torch.int32, device=model_runner.device)
-        self.flashinfer_kv_last_page_len = torch.ones((flashinfer_max_bs,), dtype=torch.int32, device=model_runner.device)
-        self.flashinfer_qo_indptr = torch.zeros((flashinfer_max_bs + 1,), dtype=torch.int32, device=model_runner.device)
-        self.flashinfer_indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner)
+        self.flashinfer_decode_wrappers = []
+        for _ in range(self.flashinfer_num_wrappers):
+            self.flashinfer_decode_wrappers.append(
+                BatchDecodeWithPagedKVCacheWrapper(
+                    self.flashinfer_workspace_buffer,
+                    "NHD",
+                    use_tensor_cores=self.flashinfer_decode_use_tensor_cores,
+                )
+            )
+
+        # one index updater is used for all decode wrappers
+        # all decoder indices are updated each time when the decode updater is called
+        self.flashinfer_indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
         
         # flashinfer cuda graph 
         self.flashinfer_max_context_len = model_runner.model_config.context_len
@@ -90,57 +141,38 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
         """Init auxiliary variables for triton attention backend."""
 
         if forward_batch.forward_mode.is_decode():
-            # attn_logits = torch.empty(
-            #     (
-            #         forward_batch.batch_size,
-            #         self.num_head,
-            #         self.num_kv_splits,
-            #         self.v_head_dim + 1,
-            #     ),
-            #     dtype=torch.float32,
-            #     device=self.device,
-            # )
-
-            # max_extend_len = None
-            
-            # flashinfer decoder update
             self.flashinfer_indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
-                decode_wrapper=self.flashinfer_decode_wrapper,
+                decode_wrappers=self.flashinfer_decode_wrappers,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
             )
+            # not used by flashinfer, accommodate triton op
             attn_logits = None
             max_extend_len = None
         else:
             attn_logits = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
+        # first initialized using triton op required data
         self.forward_metadata = attn_logits, max_extend_len
         
     def init_cuda_graph_state(self, max_bs: int):
         self.flashinfer_init_cuda_graph_state(max_bs)
         
     def flashinfer_init_cuda_graph_state(self, max_bs: int):
-        self.flashinfer_cuda_graph_kv_indices = torch.zeros(
+        cuda_graph_kv_indices = torch.zeros(
             (max_bs * self.flashinfer_max_context_len,),
             dtype=torch.int32,
             device="cuda",
         )
-
-    def triton_init_cuda_graph_state(self, max_bs: int):
-        self.cuda_graph_max_total_num_tokens = max_bs * self.cuda_graph_max_seq_len
-
-        self.cuda_graph_start_loc = torch.zeros(
-            (max_bs,), dtype=torch.int32, device=self.device
-        )
-        self.cuda_graph_attn_logits = torch.empty(
-            (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
-            dtype=torch.float32,
-            device="cuda",
-        )
+        
+        # cuda graph init for each flashinfer wrapper
+        self.flashinfer_cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
+            cuda_graph_kv_indices.clone() for _ in range(self.flashinfer_num_wrappers - 1)
+        ]
         
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -164,46 +196,33 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-        self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                    self.flashinfer_workspace_buffer,
-                    "NHD",
-                    use_cuda_graph=True,
-                    use_tensor_cores=self.flashinfer_decode_use_tensor_cores,
-                    paged_kv_indptr_buffer=self.flashinfer_kv_indptr[: num_tokens + 1],
-                    paged_kv_indices_buffer=self.flashinfer_cuda_graph_kv_indices,
-                    paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[
-                        :num_tokens
-                    ],
+        # cuda graph is captured for each batch size (bs)
+        decode_wrappers = []
+        for i in range(self.flashinfer_num_wrappers):
+            decode_wrappers.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.flashinfer_workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        use_tensor_cores=self.flashinfer_decode_use_tensor_cores,
+                        paged_kv_indptr_buffer=self.flashinfer_kv_indptr[i][: num_tokens + 1],
+                        paged_kv_indices_buffer=self.flashinfer_cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.flashinfer_kv_last_page_len[
+                            :num_tokens
+                        ],
+                    )
                 )
         seq_lens_sum = seq_lens.sum().item()
         self.flashinfer_indices_updater_decode.update(
             req_pool_indices,
             seq_lens,
             seq_lens_sum,
-            decode_wrapper=self.flashinfer_decode_wrapper,
+            decode_wrappers=decode_wrappers,
             encoder_lens=encoder_lens,
             spec_info=spec_info,
         )
-        self.flashinfer_decode_cuda_graph_metadata[bs] = self.flashinfer_decode_wrapper
-        
-    def triton_init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
-    ):
-        assert encoder_lens is None, "Not supported"
-        assert forward_mode.is_decode(), "Not supported"
-        assert spec_info is None, "Not supported"
-
-        self.forward_metadata = (
-            self.cuda_graph_attn_logits,
-            None,
-        )
+        self.flashinfer_decode_cuda_graph_metadata[bs] = decode_wrappers
+        self.forward_metadata = FlashInferDecodeMetadata(decode_wrappers)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -231,24 +250,10 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
             req_pool_indices[:bs],
             seq_lens[:bs],
             seq_lens_sum,
-            decode_wrapper=self.flashinfer_decode_cuda_graph_metadata[bs],
+            decode_wrappers=self.flashinfer_decode_cuda_graph_metadata[bs],
             encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
             spec_info=spec_info,
         )
-    
-    def triton_init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
-    ):
-        # NOTE: encoder_lens expected to be zeros or None
-        self.cuda_graph_start_loc.zero_()
-        self.cuda_graph_start_loc[1:bs] = torch.cumsum(seq_lens[: bs - 1], dim=0)
         
         
     def get_cuda_graph_seq_len_fill_value(self):
@@ -256,9 +261,6 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
     
     def flashinfer_get_cuda_graph_seq_len_fill_value(self):
         return 0
-
-    def triton_get_cuda_graph_seq_len_fill_value(self):
-        return 1
 
     def forward_extend(
         self,
@@ -308,50 +310,8 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        return self.flashinfer_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
-        # return self.triton_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         
-
-    def triton_forward_decode(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache=True,
-    ):
-        # During torch.compile, there is a bug in rotary_emb that causes the
-        # output value to have a 3D tensor shape. This reshapes the output correctly.
-        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-
-        # TODO: reuse the buffer across layers
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
-
-        attn_logits, _ = self.forward_metadata
-
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
-
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            attn_logits,
-            self.num_kv_splits,
-            layer.scaling,
-            layer.logit_cap,
-        )
-        return o
+        return self.flashinfer_forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
     
     
     def flashinfer_forward_decode(
@@ -364,7 +324,10 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         # out_cache_loc: kv cache tensor VRAM slot indexing table
-        decode_wrapper = self.flashinfer_decode_wrapper
+        decode_wrapper = self.forward_metadata.decode_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+        
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -385,9 +348,19 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
     
+    def _get_wrapper_idx(self, layer: RadixAttention):
+        # this returns either 0, -1 or 1
+        if self.flashinfer_num_wrappers == 1:
+            return 0
+        if self.flashinfer_dispatch_reason == FlashInferWrapperDispatch.SLIDING_WINDOW:
+            return layer.sliding_window_size == -1
+        if self.flashinfer_dispatch_reason == FlashInferWrapperDispatch.CROSS_ATTENTION:
+            return layer.is_cross_attention
 
+        raise ValueError(f"Unknown dispatch reason: {self.flashinfer_dispatch_reason}")
+    
 class FlashInferIndicesUpdaterDecode:
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_qo_heads = (
             model_runner.model_config.num_attention_heads // model_runner.tp_size
@@ -399,20 +372,28 @@ class FlashInferIndicesUpdaterDecode:
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
+        self.attn_backend = attn_backend
 
         # Buffers and wrappers
-        max_bs = model_runner.req_to_token_pool.size
-        self.kv_indptr = torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
-        self.kv_last_page_len = torch.ones((max_bs,), dtype=torch.int32, device=model_runner.device)
+        self.kv_indptr = attn_backend.flashinfer_kv_indptr
+        self.kv_last_page_len = attn_backend.flashinfer_kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.update = self.update_single_wrapper
+        
+        # Dispatch the update function
+        if self.attn_backend.flashinfer_dispatch_reason == FlashInferWrapperDispatch.SLIDING_WINDOW:
+            self.update = self.update_sliding_window
+        elif self.attn_backend.flashinfer_dispatch_reason == FlashInferWrapperDispatch.CROSS_ATTENTION:
+            self.update = self.update_cross_attention
+        else:
+            assert self.attn_backend.flashinfer_num_wrappers == 1
+            self.update = self.update_single_wrapper
 
     def update(
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrapper: BatchDecodeWithPagedKVCacheWrapper,
+        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
@@ -424,19 +405,87 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        decode_wrapper: BatchDecodeWithPagedKVCacheWrapper,
+        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
         self.call_begin_forward(
-            decode_wrapper,
+            decode_wrappers[0],
             req_pool_indices,
             seq_lens,
             seq_lens_sum,
-            self.kv_indptr,
+            self.kv_indptr[0],
             None,
             spec_info,
         )
+        
+    def update_sliding_window(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInfo],
+    ):
+        
+        for wrapper_id in range(2):
+            if wrapper_id == 0:
+                # Sliding window attention
+                paged_kernel_lens_tmp = torch.minimum(  # TODO: replace this with clamp
+                    seq_lens,
+                    torch.tensor(self.sliding_window_size + 1),
+                )
+                paged_kernel_lens_sum_tmp = paged_kernel_lens_tmp.sum().item()
+                kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
+            else:
+                # Full attention
+                paged_kernel_lens_tmp = seq_lens
+                paged_kernel_lens_sum_tmp = seq_lens_sum
+                kv_start_idx_tmp = None
+
+            self.call_begin_forward(
+                decode_wrappers[wrapper_id],
+                req_pool_indices,
+                paged_kernel_lens_tmp,
+                paged_kernel_lens_sum_tmp,
+                self.kv_indptr[wrapper_id],
+                kv_start_idx_tmp,
+                spec_info,
+            )
+    
+    
+    def update_cross_attention(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInfo],
+    ):
+        
+        for wrapper_id in range(2):
+            if wrapper_id == 0:
+                # Normal attention
+                paged_kernel_lens = seq_lens
+                kv_start_idx = encoder_lens
+            else:
+                # Cross attention
+                paged_kernel_lens = encoder_lens
+                kv_start_idx = torch.zeros_like(encoder_lens)
+                seq_lens_sum = encoder_lens.sum().item()
+
+            self.call_begin_forward(
+                decode_wrappers[wrapper_id],
+                req_pool_indices,
+                paged_kernel_lens,
+                seq_lens_sum,
+                self.kv_indptr[wrapper_id],
+                kv_start_idx,
+                spec_info,
+            )  
+    
 
     def call_begin_forward(
         self,
