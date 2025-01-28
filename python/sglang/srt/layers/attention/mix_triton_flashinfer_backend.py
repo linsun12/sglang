@@ -149,15 +149,11 @@ class MixTritonFlashInferAttnBackend(AttentionBackend):
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
             )
-            # not used by flashinfer, accommodate triton op
-            attn_logits = None
-            max_extend_len = None
+            self.forward_metadata = FlashInferDecodeMetadata(self.flashinfer_decode_wrappers)
         else:
             attn_logits = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
-
-        # first initialized using triton op required data
-        self.forward_metadata = attn_logits, max_extend_len
+            self.forward_metadata = attn_logits, max_extend_len
         
     def init_cuda_graph_state(self, max_bs: int):
         self.flashinfer_init_cuda_graph_state(max_bs)
