@@ -148,9 +148,12 @@ class AiterAttnBackend(AttentionBackend):
             
             self.scale = float(1.0 / (self.head_dim**0.5))
             self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-            self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32, device=self.device)
+            self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
         
             #=======================Aiter Decode Initialization Ends==========================
+            
+            
+            
             # attn_logits = torch.zeros(
             #     (
             #         bs,
@@ -328,7 +331,7 @@ class AiterAttnBackend(AttentionBackend):
             
             self.scale = float(1.0 / (self.head_dim**0.5))
             self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-            self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32, device=self.device)
+            self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
 
             # attn_logits = self.cuda_graph_attn_logits
             attn_logits = None
@@ -533,26 +536,45 @@ class AiterAttnBackend(AttentionBackend):
         #     layer.logit_cap,
         # )
         
-        print("=====================Inside decode call")
-        print("layer.tp_q_head_num: ", layer.tp_q_head_num)
-        print("layer.tp_k_head_num: ", layer.tp_k_head_num)
-        print("layer.tp_v_head_num: ", layer.tp_v_head_num)
-        print("layer.head_dim: ", layer.head_dim)
-        print("layer.qk_head_dim", layer.qk_head_dim)
-        print("layer.v_head_dim", layer.v_head_dim)
+        # print("=====================Inside decode call")
+        # print("layer.tp_q_head_num: ", layer.tp_q_head_num)
+        # print("layer.tp_k_head_num: ", layer.tp_k_head_num)
+        # print("layer.tp_v_head_num: ", layer.tp_v_head_num)
+        # print("layer.head_dim: ", layer.head_dim)
+        # print("layer.qk_head_dim", layer.qk_head_dim)
+        # print("layer.v_head_dim", layer.v_head_dim)
+        # k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim)
+        # v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, 1, layer.tp_v_head_num, layer.v_head_dim)
+        
+        # print("===============kv_indptr: ", kv_indptr)
+        # print("===============kv_indices: ", kv_indices)
+        # print("==============kv_last_page_lens: ", self.kv_last_page_lens)
+        
+        # output = o.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        # query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        
+        # print("==============output: ", output.shape)
+        # print("=============query: ", query.shape)
+        # print("===============exp_sums: ", self.exp_sums.shape)
+        # print("==============max_logits: ", self.max_logits.shape)
+        # print("===============tmp_output: ", self.tmp_output.shape)
+        # print("===============k_cache:", k_cache.shape)
+        # print("===============v_cache:", v_cache.shape)
+        # print("==============logits_cap: ", layer.logit_cap)
+        
     
         self.decode_attention_fwd(
-            o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), 
+            o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # (bs, head_num_q, head_dim_q)
             self.exp_sums, 
             self.max_logits,
             self.tmp_output, 
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim), 
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, layer.tp_k_head_num, 1, layer.qk_head_dim), 
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, layer.tp_v_head_num, 1, layer.v_head_dim), 
-            layer.tp_q_head_num, 
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+            layer.tp_k_head_num, 
             self.scale, 
-            kv_indices, 
             kv_indptr,
+            kv_indices, 
             self.kv_last_page_lens, 
             1, 
             self.max_context_len, 
@@ -567,136 +589,3 @@ class AiterAttnBackend(AttentionBackend):
         )
         return o
 
-
-# class TritonMultiStepDraftBackend:
-#     """
-#     Wrap multiple triton attention backends as one for multiple consecutive
-#     draft decoding steps.
-#     """
-
-#     def __init__(
-#         self,
-#         model_runner: ModelRunner,
-#         topk: int,
-#         speculative_num_steps: int,
-#     ):
-#         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
-
-#         self.topk = topk
-#         self.speculative_num_steps = speculative_num_steps
-#         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-#         max_bs = model_runner.req_to_token_pool.size
-#         self.kv_indptr = torch.zeros(
-#             (
-#                 self.speculative_num_steps,
-#                 max_bs + 1,
-#             ),
-#             dtype=torch.int32,
-#             device=model_runner.device,
-#         )
-#         self.attn_backends = []
-#         for i in range(self.speculative_num_steps):
-#             self.attn_backends.append(
-#                 TritonAttnBackend(
-#                     model_runner,
-#                     skip_prefill=True,
-#                     kv_indptr_buf=self.kv_indptr[i],
-#                 )
-#             )
-#         self.max_context_len = self.attn_backends[0].max_context_len
-#         self.device = model_runner.device
-#         # Cached variables for generate_draft_decode_kv_indices
-#         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-
-#     def common_template(
-#         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
-#     ):
-#         num_seqs = forward_batch.batch_size
-#         bs = self.topk * num_seqs
-#         seq_lens_sum = forward_batch.seq_lens_sum
-
-#         self.generate_draft_decode_kv_indices[
-#             (self.speculative_num_steps, num_seqs, self.topk)
-#         ](
-#             forward_batch.req_pool_indices,
-#             forward_batch.req_to_token_pool.req_to_token,
-#             forward_batch.seq_lens,
-#             kv_indices_buffer,
-#             self.kv_indptr,
-#             forward_batch.positions,
-#             num_seqs,
-#             self.topk,
-#             self.pool_len,
-#             kv_indices_buffer.shape[1],
-#             self.kv_indptr.shape[1],
-#             triton.next_power_of_2(num_seqs),
-#             triton.next_power_of_2(self.speculative_num_steps),
-#             triton.next_power_of_2(bs),
-#         )
-
-#         for i in range(self.speculative_num_steps):
-#             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-#             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-#                 : seq_lens_sum * self.topk + bs * (i + 1)
-#             ]
-#             call_fn(i, forward_batch)
-
-#     def init_forward_metadata(self, forward_batch: ForwardBatch):
-#         self.kv_indices = torch.zeros(
-#             (
-#                 self.speculative_num_steps,
-#                 forward_batch.batch_size * self.topk * self.max_context_len,
-#             ),
-#             dtype=torch.int32,
-#             device=self.device,
-#         )
-
-#         def call_fn(i, forward_batch):
-#             forward_batch.spec_info.kv_indptr = (
-#                 forward_batch.spec_info.kv_indptr.clone()
-#             )
-#             forward_batch.spec_info.kv_indices = (
-#                 forward_batch.spec_info.kv_indices.clone()
-#             )
-#             self.attn_backends[i].init_forward_metadata(forward_batch)
-
-#         self.common_template(forward_batch, self.kv_indices, call_fn)
-
-#     def init_cuda_graph_state(self, max_bs: int):
-#         self.cuda_graph_kv_indices = torch.zeros(
-#             (self.speculative_num_steps, max_bs * self.max_context_len),
-#             dtype=torch.int32,
-#             device=self.device,
-#         )
-#         for i in range(self.speculative_num_steps):
-#             self.attn_backends[i].init_cuda_graph_state(
-#                 max_bs, kv_indices_buf=self.cuda_graph_kv_indices[i]
-#             )
-
-#     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-#         def call_fn(i, forward_batch):
-#             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-#                 forward_batch.batch_size,
-#                 forward_batch.batch_size * self.topk,
-#                 forward_batch.req_pool_indices,
-#                 forward_batch.seq_lens,
-#                 encoder_lens=None,
-#                 forward_mode=ForwardMode.DECODE,
-#                 spec_info=forward_batch.spec_info,
-#             )
-
-#         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
-
-#     def init_forward_metadata_replay_cuda_graph(self, forward_batch):
-#         def call_fn(i, forward_batch):
-#             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-#                 forward_batch.batch_size,
-#                 forward_batch.req_pool_indices,
-#                 forward_batch.seq_lens,
-#                 seq_lens_sum=-1,
-#                 encoder_lens=None,
-#                 forward_mode=ForwardMode.DECODE,
-#                 spec_info=forward_batch.spec_info,
-#             )
-
-#         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
