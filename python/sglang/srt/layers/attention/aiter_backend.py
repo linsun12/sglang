@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 _AITER_PARTITION_SIZE_ROCM = 256
+_AITER_BATCH_SIZE = 128
 
 class AiterAttnBackend(AttentionBackend):
     def __init__(
@@ -100,9 +101,9 @@ class AiterAttnBackend(AttentionBackend):
         # head_num_k == head_num_v, head_num_q == head_num_o, group size = head_num_q / head_num_k,  head_num_q % head_num_k == 0
         # tensor shape stays the same for ALL attention layers
 
-        # ATTENTION: hack here, until aiter has a wrapper class to use workspace for saving intermediate data
+        # ATTENTION!!!!: hack here, until aiter has a wrapper class to use workspace for saving intermediate data
         # hardcode bs here
-        bs = 1
+        bs = _AITER_BATCH_SIZE
         max_num_partitions = (
                 self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
             ) // _AITER_PARTITION_SIZE_ROCM

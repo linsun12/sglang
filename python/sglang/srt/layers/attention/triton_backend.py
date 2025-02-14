@@ -442,8 +442,8 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        print("k shape: ", forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape)
-        print("v shape: ", forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).shape)
+        # print("k shape: ", forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape)
+        # print("v shape: ", forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).shape)
         
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

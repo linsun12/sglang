@@ -77,11 +77,11 @@ from sglang.srt.utils import (
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
-    batch_size: Tuple[int] = (1,)
+    batch_size: Tuple[int] = (128,)
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
     result_filename: str = "result.jsonl"
-    correctness_test: bool = False
+    correctness_test: bool = True
     # This is only used for correctness test
     cut_len: int = 4
     profile: bool = False
@@ -262,6 +262,7 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
+    print("====================CALL correctness check==================")
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
