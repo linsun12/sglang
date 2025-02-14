@@ -90,6 +90,44 @@ class AiterAttnBackend(AttentionBackend):
         # TODO: verify this
         self.q_dtype = model_runner.model_config.dtype
         
+        
+        #=====================Aiter Decode Initialization===========================
+        # head dimension and head number can be retrieved from both model_runner.model_config and RadixLayer
+        # RadixLayer has more flexibility on QKV head numbers and head dimensions
+        # For the purpose of initializing Aiter temp data used in decode
+        # retrieve head_num and head_dim from model_runner.model_config and assume the following
+        # head_dim == head_dim_q == head_dim_k == head_dim_v
+        # head_num_k == head_num_v, head_num_q == head_num_o, group size = head_num_q / head_num_k,  head_num_q % head_num_k == 0
+        # tensor shape stays the same for ALL attention layers
+
+        # ATTENTION: hack here, until aiter has a wrapper class to use workspace for saving intermediate data
+        # hardcode bs here
+        bs = 1
+        max_num_partitions = (
+                self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
+            ) // _AITER_PARTITION_SIZE_ROCM
+            
+        self.exp_sums = torch.empty(
+            size=(bs, self.num_head, max_num_partitions),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        
+        self.max_logits = torch.empty_like(self.exp_sums)
+        
+        self.tmp_output = torch.empty(
+            size=(bs, self.num_head, max_num_partitions, self.head_dim),
+            dtype= self.q_dtype,
+            device=self.device,
+        )
+        
+        self.scale = float(1.0 / (self.head_dim**0.5))
+        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
+        self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
+        
+        #=======================Aiter Decode Initialization Ends==========================
+            
+        
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -118,42 +156,6 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
-
-            #=====================Aiter Decode Initialization===========================
-            # head dimension and head number can be retrieved from both model_runner.model_config and RadixLayer
-            # RadixLayer has more flexibility on QKV head numbers and head dimensions
-            # For the purpose of initializing Aiter temp data used in decode
-            # retrieve head_num and head_dim from model_runner.model_config and assume the following
-            # head_dim == head_dim_q == head_dim_k == head_dim_v
-            # head_num_k == head_num_v, head_num_q == head_num_o, group size = head_num_q / head_num_k,  head_num_q % head_num_k == 0
-            # tensor shape stays the same for ALL attention layers
-            
-            max_num_partitions = (
-                self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
-            ) // _AITER_PARTITION_SIZE_ROCM
-            
-            self.exp_sums = torch.empty(
-                size=(bs, self.num_head, max_num_partitions),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            
-            self.max_logits = torch.empty_like(self.exp_sums)
-            
-            self.tmp_output = torch.empty(
-                size=(bs, self.num_head, max_num_partitions, self.head_dim),
-                dtype= self.q_dtype,
-                device=self.device,
-            )
-            
-            self.scale = float(1.0 / (self.head_dim**0.5))
-            self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-            self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
-        
-            #=======================Aiter Decode Initialization Ends==========================
-            
-            
-            
             # attn_logits = torch.zeros(
             #     (
             #         bs,
@@ -311,27 +313,27 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 
-            max_num_partitions = (
-                self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
-            ) // _AITER_PARTITION_SIZE_ROCM
+            # max_num_partitions = (
+            #     self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
+            # ) // _AITER_PARTITION_SIZE_ROCM
             
-            self.exp_sums = torch.empty(
-                size=(bs, self.num_head, max_num_partitions),
-                dtype=torch.float32,
-                device=self.device,
-            )
+            # self.exp_sums = torch.empty(
+            #     size=(bs, self.num_head, max_num_partitions),
+            #     dtype=torch.float32,
+            #     device=self.device,
+            # )
             
-            self.max_logits = torch.empty_like(self.exp_sums)
+            # self.max_logits = torch.empty_like(self.exp_sums)
             
-            self.tmp_output = torch.empty(
-                size=(bs, self.num_head, max_num_partitions, self.head_dim),
-                dtype= self.q_dtype,
-                device=self.device,
-            )
+            # self.tmp_output = torch.empty(
+            #     size=(bs, self.num_head, max_num_partitions, self.head_dim),
+            #     dtype= self.q_dtype,
+            #     device=self.device,
+            # )
             
-            self.scale = float(1.0 / (self.head_dim**0.5))
-            self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-            self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
+            # self.scale = float(1.0 / (self.head_dim**0.5))
+            # self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
+            # self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
 
             # attn_logits = self.cuda_graph_attn_logits
             attn_logits = None
