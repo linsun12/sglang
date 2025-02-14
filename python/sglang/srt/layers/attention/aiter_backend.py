@@ -148,6 +148,7 @@ class AiterAttnBackend(AttentionBackend):
             
             self.scale = float(1.0 / (self.head_dim**0.5))
             self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
+            self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32, device=self.device)
         
             #=======================Aiter Decode Initialization Ends==========================
             # attn_logits = torch.zeros(
@@ -306,8 +307,31 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                
+            max_num_partitions = (
+                self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
+            ) // _AITER_PARTITION_SIZE_ROCM
+            
+            self.exp_sums = torch.empty(
+                size=(bs, self.num_head, max_num_partitions),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            
+            self.max_logits = torch.empty_like(self.exp_sums)
+            
+            self.tmp_output = torch.empty(
+                size=(bs, self.num_head, max_num_partitions, self.head_dim),
+                dtype= self.q_dtype,
+                device=self.device,
+            )
+            
+            self.scale = float(1.0 / (self.head_dim**0.5))
+            self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
+            self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32, device=self.device)
 
-            attn_logits = self.cuda_graph_attn_logits
+            # attn_logits = self.cuda_graph_attn_logits
+            attn_logits = None
             max_extend_len = None
             qo_indptr = None
             custom_mask = None
@@ -527,8 +551,9 @@ class AiterAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, layer.tp_v_head_num, 1, layer.v_head_dim), 
             layer.tp_q_head_num, 
             self.scale, 
-            kv_indices.view(forward_batch.batch_size, -1), 
-            kv_indptr, 
+            kv_indices, 
+            kv_indptr,
+            self.kv_last_page_lens, 
             1, 
             self.max_context_len, 
             None, 
