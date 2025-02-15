@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 _AITER_PARTITION_SIZE_ROCM = 256
-_AITER_BATCH_SIZE = 128
+_MAX_BATCH_SIZE = 128 # can modify
 
 class AiterAttnBackend(AttentionBackend):
     def __init__(
@@ -70,16 +70,14 @@ class AiterAttnBackend(AttentionBackend):
         )
         
         self.head_dim = model_runner.model_config.head_dim
-        print("q head num and head dim: ", self.num_head, self.head_dim)
-        
+                
         # triton attention param
         self.num_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        
         self.num_v_head = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-2]
         
-        print("v cache shape: ", model_runner.token_to_kv_pool.get_value_buffer(0).shape)
-
         self.forward_metadata = None
 
         self.max_context_len = model_runner.model_config.context_len
@@ -102,12 +100,12 @@ class AiterAttnBackend(AttentionBackend):
         # tensor shape stays the same for ALL attention layers
 
         # ATTENTION!!!!: hack here, until aiter has a wrapper class to use workspace for saving intermediate data
-        # hardcode bs here
-        bs = _AITER_BATCH_SIZE
+        # device is NOT specified here, need to figure out a way to save these intermediate data for now
+        bs = _MAX_BATCH_SIZE
         max_num_partitions = (
                 self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
             ) // _AITER_PARTITION_SIZE_ROCM
-            
+        
         self.exp_sums = torch.empty(
             size=(bs, self.num_head, max_num_partitions),
             dtype=torch.float32,
@@ -127,12 +125,10 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
         
         #=======================Aiter Decode Initialization Ends==========================
-            
         
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init auxiliary variables for triton attention backend."""
-
+        """Init auxiliary variables"""
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
@@ -263,6 +259,7 @@ class AiterAttnBackend(AttentionBackend):
     def init_cuda_graph_state(
         self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
     ):
+        
         self.cuda_graph_attn_logits = torch.zeros(
             (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
             dtype=torch.float32,
@@ -313,28 +310,6 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-                
-            # max_num_partitions = (
-            #     self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
-            # ) // _AITER_PARTITION_SIZE_ROCM
-            
-            # self.exp_sums = torch.empty(
-            #     size=(bs, self.num_head, max_num_partitions),
-            #     dtype=torch.float32,
-            #     device=self.device,
-            # )
-            
-            # self.max_logits = torch.empty_like(self.exp_sums)
-            
-            # self.tmp_output = torch.empty(
-            #     size=(bs, self.num_head, max_num_partitions, self.head_dim),
-            #     dtype= self.q_dtype,
-            #     device=self.device,
-            # )
-            
-            # self.scale = float(1.0 / (self.head_dim**0.5))
-            # self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-            # self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
 
             # attn_logits = self.cuda_graph_attn_logits
             attn_logits = None
@@ -553,16 +528,15 @@ class AiterAttnBackend(AttentionBackend):
         # print("===============kv_indices: ", kv_indices)
         # print("==============kv_last_page_lens: ", self.kv_last_page_lens)
         
-        # output = o.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        # query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
         
-        # print("==============output: ", output.shape)
-        # print("=============query: ", query.shape)
+        # print("==============output: ", o.shape, o.device)
+        # print("=============query: ", q.shape, q.device)
         # print("===============exp_sums: ", self.exp_sums.shape)
         # print("==============max_logits: ", self.max_logits.shape)
         # print("===============tmp_output: ", self.tmp_output.shape)
-        # print("===============k_cache:", k_cache.shape)
-        # print("===============v_cache:", v_cache.shape)
+        # print("===============k_cache:", forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape, forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).device)
+        # print("===============v_cache:", forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).shape, forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).device)
         # print("==============logits_cap: ", layer.logit_cap)
         
     

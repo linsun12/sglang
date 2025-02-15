@@ -112,12 +112,12 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if capture_bs is None:
         if server_args.disable_cuda_graph_padding:
             # TODO: set it back
-            # capture_bs = list(range(1, 33)) + [64, 128]
-            capture_bs = [128]
+            capture_bs = list(range(1, 33)) + [64, 128]
+            # capture_bs = [128]
         else:
             # TODO: set it back
-            # capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
-            capture_bs = [128]
+            capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            # capture_bs = [128]
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very samll. We add more values here to make sure we capture the maximum bs.
