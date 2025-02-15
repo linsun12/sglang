@@ -91,23 +91,12 @@ class AiterAttnBackend(AttentionBackend):
         
         
         #=====================Aiter Decode Initialization===========================
-        # head dimension and head number can be retrieved from both model_runner.model_config and RadixLayer
-        # RadixLayer has more flexibility on QKV head numbers and head dimensions
-        # For the purpose of initializing Aiter temp data used in decode
-        # retrieve head_num and head_dim from model_runner.model_config and assume the following
-        # head_dim == head_dim_q == head_dim_k == head_dim_v
-        # head_num_k == head_num_v, head_num_q == head_num_o, group size = head_num_q / head_num_k,  head_num_q % head_num_k == 0
-        # tensor shape stays the same for ALL attention layers
-
-        # ATTENTION!!!!: hack here, until aiter has a wrapper class to use workspace for saving intermediate data
-        # device is NOT specified here, need to figure out a way to save these intermediate data for now
-        bs = _MAX_BATCH_SIZE
         max_num_partitions = (
                 self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
             ) // _AITER_PARTITION_SIZE_ROCM
         
         self.exp_sums = torch.empty(
-            size=(bs, self.num_head, max_num_partitions),
+            size=(_MAX_BATCH_SIZE, self.num_head, max_num_partitions),
             dtype=torch.float32,
             device=self.device,
         )
@@ -115,14 +104,14 @@ class AiterAttnBackend(AttentionBackend):
         self.max_logits = torch.empty_like(self.exp_sums)
         
         self.tmp_output = torch.empty(
-            size=(bs, self.num_head, max_num_partitions, self.head_dim),
+            size=(_MAX_BATCH_SIZE, self.num_head, max_num_partitions, self.head_dim),
             dtype= self.q_dtype,
             device=self.device,
         )
         
         self.scale = float(1.0 / (self.head_dim**0.5))
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-        self.kv_last_page_lens = torch.ones((bs, ), dtype=torch.int32).to(self.device)
+        self.kv_last_page_lens = torch.ones((_MAX_BATCH_SIZE, ), dtype=torch.int32).to(self.device)
         
         #=======================Aiter Decode Initialization Ends==========================
         
@@ -153,16 +142,6 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
-            # attn_logits = torch.zeros(
-            #     (
-            #         bs,
-            #         self.num_head,
-            #         self.num_kv_splits,
-            #         self.v_head_dim + 1,
-            #     ),
-            #     dtype=torch.float32,
-            #     device=self.device,
-            # )
             
             attn_logits = None # accomodate forward_metadata format
 
@@ -501,44 +480,6 @@ class AiterAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        # self.decode_attention_fwd(
-        #     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-        #     forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-        #     forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-        #     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-        #     kv_indptr,
-        #     kv_indices,
-        #     attn_logits,
-        #     self.num_kv_splits,
-        #     layer.scaling,
-        #     layer.logit_cap,
-        # )
-        
-        # print("=====================Inside decode call")
-        # print("layer.tp_q_head_num: ", layer.tp_q_head_num)
-        # print("layer.tp_k_head_num: ", layer.tp_k_head_num)
-        # print("layer.tp_v_head_num: ", layer.tp_v_head_num)
-        # print("layer.head_dim: ", layer.head_dim)
-        # print("layer.qk_head_dim", layer.qk_head_dim)
-        # print("layer.v_head_dim", layer.v_head_dim)
-        # k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim)
-        # v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, 1, layer.tp_v_head_num, layer.v_head_dim)
-        
-        # print("===============kv_indptr: ", kv_indptr)
-        # print("===============kv_indices: ", kv_indices)
-        # print("==============kv_last_page_lens: ", self.kv_last_page_lens)
-        
-
-        
-        # print("==============output: ", o.shape, o.device)
-        # print("=============query: ", q.shape, q.device)
-        # print("===============exp_sums: ", self.exp_sums.shape)
-        # print("==============max_logits: ", self.max_logits.shape)
-        # print("===============tmp_output: ", self.tmp_output.shape)
-        # print("===============k_cache:", forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape, forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).device)
-        # print("===============v_cache:", forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).shape, forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).device)
-        # print("==============logits_cap: ", layer.logit_cap)
-        
     
         self.decode_attention_fwd(
             o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # (bs, head_num_q, head_dim_q)

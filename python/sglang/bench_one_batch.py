@@ -77,11 +77,11 @@ from sglang.srt.utils import (
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
-    batch_size: Tuple[int] = (128,)
+    batch_size: Tuple[int] = (1,)
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
     result_filename: str = "result.jsonl"
-    correctness_test: bool = True
+    correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
     profile: bool = False
