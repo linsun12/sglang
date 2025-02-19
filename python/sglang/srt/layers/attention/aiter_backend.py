@@ -28,7 +28,7 @@ class AiterAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import
-        from ater import (
+        from aiter import (
             paged_attention_rocm,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
@@ -95,19 +95,10 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
             ) // _AITER_PARTITION_SIZE_ROCM
         
-        self.exp_sums = torch.empty(
-            size=(_MAX_BATCH_SIZE, self.num_head, max_num_partitions),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
         
-        self.max_logits = torch.empty_like(self.exp_sums)
-        
-        self.tmp_output = torch.empty(
-            size=(_MAX_BATCH_SIZE, self.num_head, max_num_partitions, self.head_dim),
-            dtype= self.q_dtype,
-            device=self.device,
-        )
+        self.workspace_buffer = torch.empty((_MAX_BATCH_SIZE * self.num_head * max_num_partitions * self.head_dim) * nbyes_per_qo_elem
+                                    + 2 * (_MAX_BATCH_SIZE * self.num_head * max_num_partitions) * 4, dtype=torch.uint8, device=self.device)
         
         self.scale = float(1.0 / (self.head_dim**0.5))
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
@@ -483,9 +474,7 @@ class AiterAttnBackend(AttentionBackend):
     
         self.decode_attention_fwd(
             o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # (bs, head_num_q, head_dim_q)
-            self.exp_sums, 
-            self.max_logits,
-            self.tmp_output, 
+            self.workspace_buffer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
