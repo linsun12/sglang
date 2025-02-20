@@ -30,7 +30,6 @@ if is_flashinfer_available():
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
-        # BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
     from flashinfer.decode import PosEncodingMode
@@ -41,8 +40,6 @@ class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
 
-# forward metadata in flashinfer are python wrappers
-# BUT why does it pass through metadata instead of directly calling from class object variables? 
 @dataclass
 class AiterDecodeMetadata:
     kv_indptr: torch.Tensor
@@ -56,7 +53,6 @@ class DecodeMetadata:
 @dataclass
 class PrefillMetadata:
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
-    use_ragged: bool
     extend_no_prefix: bool
 
 
@@ -152,10 +148,6 @@ class FlashInferAttnBackend(AttentionBackend):
             torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
             for _ in range(self.num_wrappers)
         ]
-        
-        # self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-        #     self.workspace_buffer, "NHD"
-        # )
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
@@ -262,7 +254,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=self.prefill_wrappers_paged,
-                use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
             )
@@ -276,7 +267,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=self.prefill_wrappers_verify,
-                use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
             )
@@ -514,51 +504,24 @@ class FlashInferAttnBackend(AttentionBackend):
 
         logits_soft_cap = layer.logit_cap
 
-        if not self.forward_metadata.use_ragged:
-            if k is not None:
-                assert v is not None
-                if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
-
-            o = prefill_wrapper_paged.forward(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
-                sm_scale=layer.scaling,
-                window_left=layer.sliding_window_size,
-                logits_soft_cap=logits_soft_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-            )
-        else:
-            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
-
-            if self.forward_metadata.extend_no_prefix:
-                o = o1
-            else:
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=layer.logit_cap,
-                )
-
-                o, _ = merge_state(o1, s1, o2, s2)
-
+        if k is not None:
+            assert v is not None
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+
+        o = prefill_wrapper_paged.forward(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            causal=not layer.is_cross_attention,
+            sm_scale=layer.scaling,
+            window_left=layer.sliding_window_size,
+            logits_soft_cap=logits_soft_cap,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale,
+        )
+
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -827,7 +790,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -871,7 +833,6 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
@@ -912,7 +873,6 @@ class FlashInferIndicesUpdaterPrefill:
             kv_start_idx = seq_lens - paged_kernel_lens
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -950,7 +910,6 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -966,7 +925,6 @@ class FlashInferIndicesUpdaterPrefill:
 
     def call_begin_forward(
         self,
-        wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
         wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
@@ -1009,17 +967,6 @@ class FlashInferIndicesUpdaterPrefill:
                     paged_kernel_lens,
                     self.req_to_token,
                 )
-            )
-
-        # extend part
-        if use_ragged:
-            wrapper_ragged.begin_forward(
-                qo_indptr,
-                qo_indptr,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                q_data_type=self.q_data_type,
             )
 
         # cached part
