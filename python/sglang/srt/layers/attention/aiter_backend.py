@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 _AITER_PARTITION_SIZE_ROCM = 256
-_MAX_BATCH_SIZE = 2048 # can modify
 
 class AiterAttnBackend(AttentionBackend):
     def __init__(
@@ -86,7 +85,6 @@ class AiterAttnBackend(AttentionBackend):
         
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         
-        # TODO: verify this
         self.q_dtype = model_runner.model_config.dtype
         
         
@@ -97,13 +95,12 @@ class AiterAttnBackend(AttentionBackend):
         
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
         
-        # measure buffer size here
-        self.workspace_buffer = torch.empty((_MAX_BATCH_SIZE * self.num_head * self.max_num_partitions * self.head_dim) * nbyes_per_qo_elem
-                                    + 2 * (_MAX_BATCH_SIZE * self.num_head * self.max_num_partitions) * 4, dtype=torch.uint8, device=self.device)
+        self.workspace_buffer = torch.empty((max_bs * self.num_head * self.max_num_partitions * self.head_dim) * nbyes_per_qo_elem
+                            + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4, dtype=torch.uint8, device=self.device)
         
         self.scale = float(1.0 / (self.head_dim**0.5))
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-        self.kv_last_page_lens = torch.ones((_MAX_BATCH_SIZE, ), dtype=torch.int32).to(self.device)
+        self.kv_last_page_lens = torch.ones((max_bs, ), dtype=torch.int32).to(self.device)
         
         #=======================Aiter Decode Initialization Ends==========================
         
