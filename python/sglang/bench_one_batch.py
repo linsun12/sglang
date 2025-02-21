@@ -262,7 +262,6 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
-    print("====================CALL correctness check==================")
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
