@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 """
-end to end attention solution with
-flashinfer prefill kernels + aiter decode kernels
+end to end attention solution with aiter kernels
 """
 
 import os
@@ -31,7 +30,6 @@ if is_flashinfer_available():
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
     )
-    from flashinfer.cascade import merge_state
     from flashinfer.decode import PosEncodingMode
     
 from aiter import paged_attention_rocm
@@ -56,13 +54,16 @@ class PrefillMetadata:
     extend_no_prefix: bool
 
 
-# Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
+USE_AITER_DECODE_KERNEL = True # force to use decode kernels for decode
 
-class FlashInferAttnBackend(AttentionBackend):
+# call flashinfer decode wrapper only when USE_AITER_DECODE_KERNEL=False && use_tensor_cores = True
+# or if we want to combine flashinfer decode kernels
+
+class AiterAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
     def __init__(
@@ -74,19 +75,23 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
 
         # following data are read from model_config assuming these values are the same across different attention layers
-        # These values can be retrieved from attention layer level
+        # These values can be retrieved from attention layer level as well
+        # AttentionBackend is at the granularity of device, meaning each gpu will have one attentin backend
+        # forward calls are at the granualarity of per forward_batch and per layer
+        # variables defined here are variables reused across layers on the same machine
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
-        self.num_head = model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        self.num_head = model_runner.model_config.num_attention_heads // get_attention_tp_size() # sharding on number of heads
         self.head_dim = model_runner.model_config.head_dim
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(get_attention_tp_size())
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        
+
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         
         
         # Parse constants
+        # for grok-1 this will be False
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=self.kv_cache_dtype,
             num_attention_heads=self.num_head,
@@ -114,7 +119,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures:
             global_config.flashinfer_workspace_size = 512 * 1024 * 1024
 
-        # Allocate buffers
+        # Allocate buffers for prefill kernels
         global global_workspace_buffer
         if global_workspace_buffer is None:
             global_workspace_buffer = torch.empty(
@@ -123,13 +128,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 device=model_runner.device,
             )
         
-        # workspace buffer used by flashinfer
         self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
         
         # maximum bs based on maximum capacity of req_to_token_pool
-        # why is different kv_indptr with different bs passed to forward call? 
-        # the following 3 params are BUFFERS based on maximum memory required
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -167,7 +169,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
                 )
             
-            if self.decode_use_tensor_cores:
+            if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
                 self.decode_wrappers.append(
                     BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -176,7 +178,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
                 
-        # at this point if self.decode_use_tensor_cores = False, self.decode_wrappers = []
+        # at this point if self.decode_use_tensor_cores = False or USE_AITER_DECODE_KERNEL = True, self.decode_wrappers = []
         
         
 
@@ -192,7 +194,7 @@ class FlashInferAttnBackend(AttentionBackend):
         
         #===========================aiter decode initialization=============================
         # this is irrelevant to bs
-        if not self.decode_use_tensor_cores:
+        if not self.decode_use_tensor_cores or USE_AITER_DECODE_KERNEL:
             max_num_partitions = (self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1) // _AITER_PARTITION_SIZE_ROCM
             nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
             self.aiter_workspace_buffer = torch.empty((max_bs * self.num_head * max_num_partitions * self.head_dim) * nbyes_per_qo_elem
@@ -210,7 +212,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
-            if self.decode_use_tensor_cores:
+            if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
                 self.indices_updater_decode.update(
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
@@ -278,10 +280,8 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
 
             if self.is_multimodal:
-                use_ragged = False
                 extend_no_prefix = False
             else:
-                use_ragged = True
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             self.indices_updater_prefill.update(
@@ -290,12 +290,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_sum,
                 prefix_lens,
                 prefill_wrappers=self.prefill_wrappers_paged,
-                use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged, use_ragged, extend_no_prefix
+                self.prefill_wrappers_paged, extend_no_prefix
             )
 
     def init_cuda_graph_state(
@@ -337,7 +336,7 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode_or_idle():
-            if self.decode_use_tensor_cores:
+            if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
                 decode_wrappers = []
                 for i in range(self.num_wrappers):
                     decode_wrappers.append(
@@ -413,7 +412,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
-                use_ragged=False,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
@@ -434,7 +432,7 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         # this will be called everytime when cuda graph for certain bs is replayed
         if forward_mode.is_decode_or_idle():
-            if self.decode_use_tensor_cores:
+            if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
                 self.indices_updater_decode.update(
                     req_pool_indices[:bs],
                     seq_lens[:bs],
@@ -474,7 +472,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
@@ -548,7 +545,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
                     
-        if self.decode_use_tensor_cores:
+        if self.decode_use_tensor_cores and not USE_AITER_DECODE_KERNEL:
             decode_wrapper = self.forward_metadata.decode_wrappers[
                 self._get_wrapper_idx(layer)
             ]
@@ -807,7 +804,6 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
-        use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
@@ -821,16 +817,12 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
-        use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
-        if use_ragged:
-            paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
-        else:
-            paged_kernel_lens = seq_lens
-            paged_kernel_lens_sum = seq_lens_sum
+
+        paged_kernel_lens = seq_lens
+        paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
             prefill_wrappers[0],
@@ -842,7 +834,6 @@ class FlashInferIndicesUpdaterPrefill:
             None,
             self.kv_indptr[0],
             self.qo_indptr[0],
-            use_ragged,
             spec_info,
         )
 
@@ -853,7 +844,6 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
-        use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
@@ -882,7 +872,6 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
                 self.qo_indptr[wrapper_id],
-                use_ragged,
                 spec_info,
             )
 
@@ -893,7 +882,6 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
-        use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
     ):
@@ -919,7 +907,6 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_start_idx,
                 self.kv_indptr[wrapper_id],
                 self.qo_indptr[wrapper_id],
-                use_ragged,
                 spec_info,
             )
 
@@ -934,7 +921,6 @@ class FlashInferIndicesUpdaterPrefill:
         kv_start_idx: torch.Tensor,
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
-        use_ragged: bool,
         spec_info: Optional[SpecInfo],
     ):
         bs = len(req_pool_indices)
@@ -983,144 +969,6 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask=custom_mask,
             non_blocking=True,
         )
-
-
-# class FlashInferMultiStepDraftBackend:
-#     """
-#     Wrap multiple flashinfer attention backends as one for multiple consecutive
-#     draft decoding steps.
-#     """
-
-#     def __init__(
-#         self,
-#         model_runner: ModelRunner,
-#         topk: int,
-#         speculative_num_steps: int,
-#     ):
-#         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
-
-#         self.topk = topk
-#         self.speculative_num_steps = speculative_num_steps
-#         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-#         max_bs = model_runner.req_to_token_pool.size
-#         self.kv_indptr = torch.zeros(
-#             (
-#                 self.speculative_num_steps,
-#                 max_bs + 1,
-#             ),
-#             dtype=torch.int32,
-#             device=model_runner.device,
-#         )
-#         self.attn_backends = []
-#         for i in range(self.speculative_num_steps):
-#             self.attn_backends.append(
-#                 FlashInferAttnBackend(
-#                     model_runner,
-#                     skip_prefill=True,
-#                     kv_indptr_buf=self.kv_indptr[i],
-#                 )
-#             )
-#         self.max_context_len = self.attn_backends[0].max_context_len
-#         # Cached variables for generate_draft_decode_kv_indices
-#         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-
-#     def common_template(
-#         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
-#     ):
-#         num_seqs = forward_batch.batch_size
-#         bs = self.topk * num_seqs
-#         seq_lens_sum = forward_batch.seq_lens_sum
-
-#         self.generate_draft_decode_kv_indices[
-#             (self.speculative_num_steps, num_seqs, self.topk)
-#         ](
-#             forward_batch.req_pool_indices,
-#             forward_batch.req_to_token_pool.req_to_token,
-#             forward_batch.seq_lens,
-#             kv_indices_buffer,
-#             self.kv_indptr,
-#             forward_batch.positions,
-#             num_seqs,
-#             self.topk,
-#             self.pool_len,
-#             kv_indices_buffer.shape[1],
-#             self.kv_indptr.shape[1],
-#             triton.next_power_of_2(num_seqs),
-#             triton.next_power_of_2(self.speculative_num_steps),
-#             triton.next_power_of_2(bs),
-#         )
-
-#         for i in range(self.speculative_num_steps - 1):
-#             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-#             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-#                 : seq_lens_sum * self.topk + bs * (i + 1)
-#             ]
-#             call_fn(i, forward_batch)
-
-#     def init_forward_metadata(self, forward_batch: ForwardBatch):
-#         kv_indices = torch.zeros(
-#             (
-#                 self.speculative_num_steps,
-#                 forward_batch.batch_size * self.topk * self.max_context_len,
-#             ),
-#             dtype=torch.int32,
-#             device="cuda",
-#         )
-
-#         def call_fn(i, forward_batch):
-#             forward_batch.spec_info.kv_indptr = (
-#                 forward_batch.spec_info.kv_indptr.clone()
-#             )
-#             forward_batch.spec_info.kv_indices = (
-#                 forward_batch.spec_info.kv_indices.clone()
-#             )
-#             self.attn_backends[i].init_forward_metadata(forward_batch)
-
-#         self.common_template(forward_batch, kv_indices, call_fn)
-
-#     def init_cuda_graph_state(self, max_bs: int):
-#         self.cuda_graph_kv_indices = torch.zeros(
-#             (self.speculative_num_steps, max_bs * self.max_context_len),
-#             dtype=torch.int32,
-#             device="cuda",
-#         )
-#         for i in range(self.speculative_num_steps):
-#             self.attn_backends[i].init_cuda_graph_state(
-#                 max_bs, kv_indices_buf=self.cuda_graph_kv_indices[i]
-#             )
-
-#     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-#         def call_fn(i, forward_batch):
-#             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-#                 forward_batch.batch_size,
-#                 forward_batch.batch_size * self.topk,
-#                 forward_batch.req_pool_indices,
-#                 forward_batch.seq_lens,
-#                 encoder_lens=None,
-#                 forward_mode=ForwardMode.DECODE,
-#                 spec_info=forward_batch.spec_info,
-#             )
-#             decode_wrapper = self.attn_backends[i].decode_cuda_graph_metadata[
-#                 forward_batch.batch_size
-#             ][0]
-#             decode_wrapper.begin_forward = partial(fast_decode_plan, decode_wrapper)
-
-#         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
-
-#     def init_forward_metadata_replay_cuda_graph(self, forward_batch):
-#         def call_fn(i, forward_batch):
-#             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-#                 forward_batch.batch_size,
-#                 forward_batch.req_pool_indices,
-#                 forward_batch.seq_lens,
-#                 seq_lens_sum=-1,
-#                 encoder_lens=None,
-#                 forward_mode=ForwardMode.DECODE,
-#                 spec_info=forward_batch.spec_info,
-#             )
-
-#         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
-
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
@@ -1191,88 +1039,3 @@ def should_use_tensor_core(
     else:
         return False
 
-
-# def fast_decode_plan(
-#     self,
-#     indptr: torch.Tensor,
-#     indices: torch.Tensor,
-#     last_page_len: torch.Tensor,
-#     num_qo_heads: int,
-#     num_kv_heads: int,
-#     head_dim: int,
-#     page_size: int,
-#     pos_encoding_mode: str = "NONE",
-#     window_left: int = -1,
-#     logits_soft_cap: Optional[float] = None,
-#     data_type: Union[str, torch.dtype] = "float16",
-#     q_data_type: Optional[Union[str, torch.dtype]] = None,
-#     sm_scale: Optional[float] = None,
-#     rope_scale: Optional[float] = None,
-#     rope_theta: Optional[float] = None,
-#     **kwargs,
-# ) -> None:
-#     """A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend."""
-#     batch_size = len(last_page_len)
-#     if logits_soft_cap is None:
-#         logits_soft_cap = 0.0
-#     if self.is_cuda_graph_enabled:
-#         if batch_size != self._fixed_batch_size:
-#             raise ValueError(
-#                 "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
-#                 " mismatches the batch size set during initialization {}".format(
-#                     batch_size, self._fixed_batch_size
-#                 )
-#             )
-#         if len(indices) > len(self._paged_kv_indices_buf):
-#             raise ValueError(
-#                 "The size of indices should be less than or equal to the allocated buffer"
-#             )
-#     else:
-#         self._paged_kv_indptr_buf = indptr
-#         self._paged_kv_indices_buf = indices
-#         self._paged_kv_last_page_len_buf = last_page_len
-#     # NOTE(Zihao): the following tensors acts as placeholder to pass dtype info
-#     if not q_data_type:
-#         q_data_type = data_type
-#     if not hasattr(self, "empty_q_data"):
-#         self.empty_q_data = torch.empty(
-#             0,
-#             dtype=(
-#                 getattr(torch, q_data_type)
-#                 if isinstance(q_data_type, str)
-#                 else q_data_type
-#             ),
-#         )
-#         self.empty_kv_cache = torch.empty(
-#             0,
-#             dtype=(
-#                 getattr(torch, data_type) if isinstance(data_type, str) else data_type
-#             ),
-#         )
-#         self.last_page_len = torch.ones(32768, dtype=torch.int32)
-#     empty_q_data = self.empty_q_data
-#     empty_kv_cache = self.empty_kv_cache
-#     stream = torch.cuda.current_stream()
-#     self._cached_module.plan(
-#         self._float_workspace_buffer,
-#         self._int_workspace_buffer,
-#         self._pin_memory_int_workspace_buffer,
-#         indptr.to("cpu"),
-#         batch_size,
-#         num_qo_heads,
-#         num_kv_heads,
-#         page_size,
-#         self.is_cuda_graph_enabled,
-#         window_left,
-#         logits_soft_cap,
-#         head_dim,
-#         empty_q_data,
-#         empty_kv_cache,
-#         stream.cuda_stream,
-#     )
-#     self._pos_encoding_mode = pos_encoding_mode
-#     self._window_left = window_left
-#     self._logits_soft_cap = logits_soft_cap
-#     self._sm_scale = sm_scale
-#     self._rope_scale = rope_scale
-#     self._rope_theta = rope_theta
